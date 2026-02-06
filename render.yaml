@@ -1,15 +1,13 @@
 services:
   - type: web
-    name: mother-bot
+    name: anonymous-chat-bot
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
+    startCommand: python bot.py
     envVars:
-      - key: MOTHER_BOT_TOKEN
+      - key: MASTER_BOT_TOKEN
         sync: false
-      - key: MAX_BOTS_PER_USER
-        value: "3"
+      - key: WEBHOOK_URL
+        sync: false
       - key: PORT
-        value: "10000"
-    healthCheckPath: /health
-    autoDeploy: true
+        value: 10000
