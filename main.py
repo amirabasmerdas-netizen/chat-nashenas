@@ -1,610 +1,625 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ربات مادر ساخت ربات چت ناشناس - نسخه تضمین شده برای رندر
+ربات تلگرام چت ناشناس - نسخه تک فایل
 """
 
 import os
-import sys
+import json
 import logging
-import sqlite3
-import hashlib
-import time
+import threading
+import asyncio
 from datetime import datetime
-from contextlib import contextmanager
+from typing import Dict, List, Optional, Tuple, Any
+
+from flask import Flask, request, jsonify
+import telebot
+from telebot import types
+from telebot.async_telebot import AsyncTeleBot
+import aiohttp
+from aiohttp import web
 
 # تنظیمات لاگ
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO,
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('bot.log', encoding='utf-8')
-    ]
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# ==================== تلگرام با سازگاری کامل ====================
-try:
-    # سعی می‌کنیم با سازگاری کامل import کنیم
-    import telegram
-    from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
-    from telegram.ext import Updater, CommandHandler, MessageHandler, CallbackQueryHandler, CallbackContext
-    from telegram import ParseMode
-    
-    # بررسی ورژن
-    telegram_version = telegram.__version__
-    logger.info(f"✅ کتابخانه تلگرام ورژن {telegram_version} import شد")
-    
-    # برای ورژن‌های مختلف
-    try:
-        from telegram.ext import Filters
-        FILTERS = Filters
-    except ImportError:
-        try:
-            from telegram.ext import filters
-            FILTERS = filters
-        except ImportError:
-            # ساخت Filters دستی
-            class Filters:
-                text = lambda x: True
-                command = lambda x: False
-            FILTERS = Filters
-    
-    TELEGRAM_OK = True
-    
-except ImportError as e:
-    logger.error(f"❌ خطا در import تلگرام: {e}")
-    TELEGRAM_OK = False
-
-# ==================== کلاس دیتابیس ====================
-class Database:
-    def __init__(self, db_path="mother_bots.db"):
-        self.db_path = db_path
-        self.init_db()
-    
-    @contextmanager
-    def get_connection(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        try:
-            yield conn
-        finally:
-            conn.close()
-    
-    def init_db(self):
-        with self.get_connection() as conn:
-            c = conn.cursor()
-            
-            # کاربران
-            c.execute('''CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                last_name TEXT,
-                created_at TEXT,
-                bot_count INTEGER DEFAULT 0
-            )''')
-            
-            # ربات‌ها
-            c.execute('''CREATE TABLE IF NOT EXISTS bots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                bot_id TEXT UNIQUE,
-                token TEXT UNIQUE,
-                owner_id INTEGER,
-                bot_username TEXT,
-                bot_name TEXT,
-                created_at TEXT,
-                status TEXT DEFAULT 'active'
-            )''')
-            
-            conn.commit()
-            logger.info(f"✅ دیتابیس در {self.db_path} راه‌اندازی شد")
-    
-    def add_user(self, user_id, username, first_name, last_name=""):
-        with self.get_connection() as conn:
-            c = conn.cursor()
-            c.execute('''INSERT OR IGNORE INTO users 
-                       (user_id, username, first_name, last_name, created_at) 
-                       VALUES (?, ?, ?, ?, ?)''',
-                     (user_id, username or "", first_name, last_name, datetime.now().isoformat()))
-            conn.commit()
-    
-    def add_bot(self, bot_id, token, owner_id, bot_username, bot_name):
-        with self.get_connection() as conn:
-            c = conn.cursor()
-            c.execute('''INSERT INTO bots 
-                       (bot_id, token, owner_id, bot_username, bot_name, created_at) 
-                       VALUES (?, ?, ?, ?, ?, ?)''',
-                     (bot_id, token, owner_id, bot_username, bot_name, datetime.now().isoformat()))
-            
-            c.execute('''UPDATE users 
-                       SET bot_count = bot_count + 1 
-                       WHERE user_id = ?''', (owner_id,))
-            
-            conn.commit()
-            logger.info(f"✅ ربات {bot_id} برای کاربر {owner_id} ذخیره شد")
-    
-    def get_user_bots(self, user_id):
-        with self.get_connection() as conn:
-            c = conn.cursor()
-            c.execute('SELECT * FROM bots WHERE owner_id = ? ORDER BY created_at DESC', (user_id,))
-            return [dict(row) for row in c.fetchall()]
-    
-    def get_user_bot_count(self, user_id):
-        with self.get_connection() as conn:
-            c = conn.cursor()
-            c.execute('SELECT bot_count FROM users WHERE user_id = ?', (user_id,))
-            row = c.fetchone()
-            return row['bot_count'] if row else 0
-    
-    def get_bot_by_token(self, token):
-        with self.get_connection() as conn:
-            c = conn.cursor()
-            c.execute('SELECT * FROM bots WHERE token = ?', (token,))
-            row = c.fetchone()
-            return dict(row) if row else None
-
-# ==================== کلاس ربات اصلی ====================
-class MotherBot:
-    def __init__(self):
-        # خواندن توکن
-        self.token = os.environ.get('MOTHER_BOT_TOKEN', '').strip()
-        if not self.token or self.token == 'YOUR_BOT_TOKEN_HERE':
-            logger.error("❌ متغیر MOTHER_BOT_TOKEN تنظیم نشده است!")
-            logger.error("لطفاً در رندر: Environment Variables → MOTHER_BOT_TOKEN")
-            raise ValueError("توکن ربات تنظیم نشده است")
+# ========== کلاس اصلی ربات مادر ==========
+class AnonymousChatBot:
+    def __init__(self, token: str, webhook_url: str = None, port: int = 8443):
+        """
+        مقداردهی اولیه ربات مادر
         
-        self.db = Database()
-        self.max_bots = int(os.environ.get('MAX_BOTS_PER_USER', '3'))
+        Args:
+            token: توکن ربات مادر
+            webhook_url: آدرس وب هوک
+            port: پورت برای اجرای سرور
+        """
+        self.master_token = token
+        self.bot = AsyncTeleBot(token)
+        self.webhook_url = webhook_url
+        self.port = port
         
-        if not TELEGRAM_OK:
-            logger.error("❌ کتابخانه تلگرام در دسترس نیست!")
-            raise ImportError("پکیج python-telegram-bot نصب نیست")
+        # دیکشنری برای ذخیره ربات‌های کاربران: {user_id: {'bot': bot_instance, 'token': token, 'owner_id': owner_id}}
+        self.user_bots: Dict[int, Dict] = {}
         
-        # ساخت Updater
-        self.updater = Updater(self.token, use_context=True)
-        self.dispatcher = self.updater.dispatcher
+        # دیکشنری برای ذخیره پیام‌های در انتظار: {user_bot_owner_id: [messages]}
+        self.pending_messages: Dict[int, List] = {}
+        
+        # دیکشنری برای نگاشت چت‌ها: {anonymous_user_id: owner_id}
+        self.chat_mapping: Dict[int, int] = {}
         
         # تنظیم هندلرها
         self.setup_handlers()
         
-        logger.info(f"✅ ربات مادر با توکن {self.token[:10]}... راه‌اندازی شد")
-        logger.info(f"📊 حداکثر ربات هر کاربر: {self.max_bots}")
+        # تنظیمات رندر
+        self.render_config = {
+            'welcome_message': "🎭 به ربات چت ناشناس خوش آمدید!\n\n"
+                              "از طریق این ربات می‌توانید با مخاطبین خود به صورت ناشناس چت کنید.\n\n"
+                              "دستورات:\n"
+                              "/start - شروع کار با ربات\n"
+                              "/addbot - افزودن ربات ناشناس خود\n"
+                              "/mybots - مشاهده ربات‌های من\n"
+                              "/help - راهنمایی",
+            
+            'add_bot_instructions': "🤖 برای ایجاد ربات ناشناس خود:\n\n"
+                                   "1. به @BotFather در تلگرام مراجعه کنید\n"
+                                   "2. دستور /newbot را ارسال کنید\n"
+                                   "3. نام و یوزرنیم برای ربات انتخاب کنید\n"
+                                   "4. توکن دریافتی را برای من ارسال کنید\n\n"
+                                   "⚠️ توجه: مالک ربات شما خواهید بود و فقط شما می‌توانید پیام‌ها را مشاهده کنید.",
+            
+            'bot_added_success': "✅ ربات شما با موفقیت اضافه شد!\n\n"
+                                "ربات شما آماده دریافت پیام‌های ناشناس است.\n"
+                                "کاربران با یوزرنیم ربات شما می‌توانند پیام ناشناس ارسال کنند.",
+            
+            'no_bots_found': "🤖 شما هیچ رباتی اضافه نکرده‌اید.\n"
+                            "از دستور /addbot برای افزودن ربات استفاده کنید.",
+            
+            'bot_list': "📋 ربات‌های شما:\n\n",
+            
+            'message_received': "📩 پیام ناشناس جدید دریافت شد!\n\n",
+            
+            'view_profile_btn': "👤 مشاهده پروفایل",
+            
+            'reply_btn': "↪️ پاسخ",
+            
+            'block_btn': "🚫 مسدود کردن",
+            
+            'back_btn': "🔙 بازگشت",
+            
+            'help_message': "📚 راهنمای ربات چت ناشناس:\n\n"
+                           "• شما می‌توانید چندین ربات ناشناس ایجاد کنید\n"
+                           "• هر ربات فقط برای شما پیام‌ها را نمایش می‌دهد\n"
+                           "• کاربران از طریق یوزرنیم ربات شما می‌توانند پیام بفرستند\n"
+                           "• پیام‌ها کاملاً ناشناس هستند\n"
+                           "• می‌توانید به پیام‌ها پاسخ دهید\n\n"
+                           "دستورات:\n"
+                           "/start - شروع\n"
+                           "/addbot - افزودن ربات\n"
+                           "/mybots - لیست ربات‌ها\n"
+                           "/help - راهنمایی"
+        }
     
     def setup_handlers(self):
-        """تنظیم هندلرهای ربات"""
-        # دستورات
-        self.dispatcher.add_handler(CommandHandler("start", self.start))
-        self.dispatcher.add_handler(CommandHandler("help", self.help))
-        self.dispatcher.add_handler(CommandHandler("mybots", self.my_bots))
-        self.dispatcher.add_handler(CommandHandler("profile", self.profile))
+        """تنظیم هندلرهای ربات مادر"""
         
-        # پیام‌های متنی (بدون استفاده از Filters مشکل‌ساز)
-        self.dispatcher.add_handler(MessageHandler(
-            FILTERS.text & ~FILTERS.command, 
-            self.handle_message
-        ))
-        
-        # کلیک روی دکمه‌ها
-        self.dispatcher.add_handler(CallbackQueryHandler(self.handle_callback))
-        
-        # هندلر خطا
-        self.dispatcher.add_error_handler(self.error_handler)
-    
-    def start(self, update: Update, context: CallbackContext):
-        """دستور /start"""
-        user = update.effective_user
-        
-        # ذخیره کاربر
-        self.db.add_user(
-            user.id,
-            user.username or "",
-            user.first_name,
-            user.last_name or ""
-        )
-        
-        # کیبورد
-        keyboard = [
-            [KeyboardButton("🤖 ساخت ربات جدید")],
-            [KeyboardButton("📋 ربات‌های من"), KeyboardButton("ℹ️ راهنما")],
-            [KeyboardButton("👤 پروفایل من")]
-        ]
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        
-        text = (
-            "👋 **به ربات مادر ساخت ربات چت ناشناس خوش آمدید!**\n\n"
-            "من می‌توانم برای شما ربات چت ناشناس شخصی بسازم.\n"
-            "کاربران می‌توانند پیام‌های ناشناس برای شما ارسال کنند.\n\n"
-            "👇 از دکمه‌های زیر استفاده کنید:"
-        )
-        
-        update.message.reply_text(
-            text,
-            reply_markup=reply_markup,
-            parse_mode=ParseMode.MARKDOWN
-        )
-    
-    def help(self, update: Update, context: CallbackContext):
-        """دستور /help"""
-        text = (
-            "📚 **راهنمای استفاده:**\n\n"
-            "🔸 **مراحل ساخت ربات:**\n"
-            "1. به @BotFather بروید\n"
-            "2. /newbot را بزنید\n"
-            "3. ربات جدید بسازید\n"
-            "4. توکن را کپی کنید\n"
-            "5. توکن را اینجا ارسال کنید\n\n"
-            "🔸 **توکن ربات چیست؟**\n"
-            "`1234567890:ABCdefGHIJKLMNopqRSTUvwxYZ`\n\n"
-            "🔸 **دستورات:**\n"
-            "/start - شروع کار\n"
-            "/mybots - ربات‌های شما\n"
-            "/profile - اطلاعات شما\n"
-            "/help - این راهنما\n\n"
-            "⚠️ توکن ربات مانند رمز عبور است!"
-        )
-        
-        update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-    
-    def my_bots(self, update: Update, context: CallbackContext):
-        """دستور /mybots"""
-        user = update.effective_user
-        bots = self.db.get_user_bots(user.id)
-        
-        if not bots:
-            update.message.reply_text(
-                "📭 **شما هنوز هیچ رباتی نساخته‌اید!**\n\n"
-                "برای ساخت اولین ربات، روی '🤖 ساخت ربات جدید' کلیک کنید.",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-        
-        text = "🤖 **ربات‌های شما:**\n\n"
-        for i, bot in enumerate(bots, 1):
-            created = datetime.fromisoformat(bot['created_at']).strftime('%Y-%m-%d')
-            text += f"{i}. **{bot['bot_name']}**\n"
-            text += f"   👤: @{bot['bot_username']}\n"
-            text += f"   📅: {created}\n\n"
-        
-        # دکمه‌ها
-        keyboard = []
-        for bot in bots[:3]:
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"🔗 {bot['bot_name']}",
-                    url=f"https://t.me/{bot['bot_username']}"
-                )
-            ])
-        
-        keyboard.append([
-            InlineKeyboardButton("➕ ساخت جدید", callback_data="create"),
-            InlineKeyboardButton("🔄 بروزرسانی", callback_data="refresh")
-        ])
-        
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        update.message.reply_text(
-            text,
-            reply_markup=reply_markup,
-            parse_mode=ParseMode.MARKDOWN
-        )
-    
-    def profile(self, update: Update, context: CallbackContext):
-        """دستور /profile"""
-        user = update.effective_user
-        bot_count = self.db.get_user_bot_count(user.id)
-        
-        text = (
-            f"👤 **پروفایل شما:**\n\n"
-            f"🆔 آیدی: `{user.id}`\n"
-            f"👤 نام: {user.first_name} {user.last_name or ''}\n"
-            f"📱 کاربری: @{user.username or 'ندارد'}\n"
-            f"🤖 ربات‌ها: {bot_count}/{self.max_bots}\n\n"
-            f"برای ساخت ربات جدید روی '🤖 ساخت ربات جدید' کلیک کنید."
-        )
-        
-        update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-    
-    def handle_message(self, update: Update, context: CallbackContext):
-        """مدیریت پیام‌های متنی"""
-        user = update.effective_user
-        text = update.message.text
-        
-        if text == "🤖 ساخت ربات جدید":
-            update.message.reply_text(
-                "🔑 **لطفاً توکن ربات خود را ارسال کنید:**\n\n"
-                "توکن ربات شما چیزی شبیه به این است:\n"
-                "`1234567890:ABCdefGHIJKLMNopqRSTUvwxYZ`",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            context.user_data['waiting'] = True
-        
-        elif text == "📋 ربات‌های من":
-            self.my_bots(update, context)
-        
-        elif text == "ℹ️ راهنما":
-            self.help(update, context)
-        
-        elif text == "👤 پروفایل من":
-            self.profile(update, context)
-        
-        elif context.user_data.get('waiting'):
-            self.handle_token(update, context, text)
-            context.user_data.pop('waiting', None)
-        
-        else:
-            update.message.reply_text(
-                "لطفاً از دکمه‌های زیر استفاده کنید:\n\n"
-                "🤖 ساخت ربات جدید\n"
-                "📋 ربات‌های من\n"
-                "ℹ️ راهنما\n"
-                "👤 پروفایل من"
-            )
-    
-    def handle_token(self, update: Update, context: CallbackContext, token: str):
-        """پردازش توکن"""
-        user = update.effective_user
-        
-        # بررسی تعداد
-        count = self.db.get_user_bot_count(user.id)
-        if count >= self.max_bots:
-            update.message.reply_text(
-                f"⚠️ **شما به حداکثر تعداد رسیده‌اید!**\n\n"
-                f"تعداد: {count}/{self.max_bots}",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-        
-        # اعتبارسنجی
-        if not self.check_token(token):
-            update.message.reply_text(
-                "❌ **توکن نامعتبر است!**\n\n"
-                "فرمت صحیح:\n"
-                "`عدد:رشته حروف و اعداد`",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-        
-        # بررسی تکراری
-        if self.db.get_bot_by_token(token):
-            update.message.reply_text(
-                "⚠️ **این توکن قبلاً ثبت شده است!**",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-        
-        # تست توکن
-        info = self.test_token(token)
-        if not info:
-            update.message.reply_text(
-                "❌ **نمی‌توانم به ربات دسترسی پیدا کنم!**\n\n"
-                "لطفاً توکن را بررسی کنید.",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-        
-        # ساخت آیدی
-        bot_hash = hashlib.md5(f"{token}_{user.id}_{int(time.time())}".encode()).hexdigest()[:8]
-        bot_id = f"bot_{bot_hash}"
-        
-        # ذخیره
-        self.db.add_bot(bot_id, token, user.id, info['username'], info['name'])
-        
-        # نمایش موفقیت
-        success = (
-            f"🎉 **ربات شما ساخته شد!**\n\n"
-            f"🤖 **ربات:** {info['name']}\n"
-            f"👤 **مالک:** شما\n"
-            f"📅 **زمان:** {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
-            f"✅ ربات شما آماده است!\n"
-            f"کاربران می‌توانند پیام ناشناس ارسال کنند.\n\n"
-            f"🔗 **لینک:** https://t.me/{info['username']}"
-        )
-        
-        # دکمه‌ها
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    "🔗 باز کردن ربات",
-                    url=f"https://t.me/{info['username']}"
-                )
-            ],
-            [
-                InlineKeyboardButton("➕ ساخت جدید", callback_data="create"),
-                InlineKeyboardButton("📋 همه ربات‌ها", callback_data="show")
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        update.message.reply_text(
-            success,
-            reply_markup=reply_markup,
-            parse_mode=ParseMode.MARKDOWN
-        )
-        
-        # راهنما
-        guide = (
-            f"📖 **راهنمای استفاده:**\n\n"
-            f"1. ربات شما (@{info['username']}) آماده است\n"
-            f"2. دوستانتان را به ربات دعوت کنید\n"
-            f"3. آن‌ها پیام ناشناس ارسال می‌کنند\n"
-            f"4. شما پیام‌ها را دریافت می‌کنید\n\n"
-            f"✨ برای تغییر تنظیمات به @BotFather مراجعه کنید."
-        )
-        
-        update.message.reply_text(guide, parse_mode=ParseMode.MARKDOWN)
-    
-    def handle_callback(self, update: Update, context: CallbackContext):
-        """کلیک روی دکمه‌ها"""
-        query = update.callback_query
-        query.answer()
-        
-        data = query.data
-        
-        if data == "create":
-            query.edit_message_text(
-                "🔑 **لطفاً توکن ربات خود را ارسال کنید:**\n\n"
-                "توکن ربات شما چیزی شبیه به این است:\n"
-                "`1234567890:ABCdefGHIJKLMNopqRSTUvwxYZ`",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            context.user_data['waiting'] = True
-        
-        elif data == "show":
-            self.my_bots(update, context)
-        
-        elif data == "refresh":
-            self.my_bots(update, context)
-    
-    def check_token(self, token: str) -> bool:
-        """اعتبارسنجی توکن"""
-        try:
-            parts = token.split(':')
-            if len(parts) != 2:
-                return False
-            if not parts[0].isdigit():
-                return False
-            if len(parts[1]) < 10:
-                return False
-            return True
-        except:
-            return False
-    
-    def test_token(self, token: str):
-        """تست توکن"""
-        try:
-            test_updater = Updater(token, use_context=True)
-            bot = test_updater.bot.get_me()
+        @self.bot.message_handler(commands=['start'])
+        async def start_handler(message):
+            """هندلر دستور /start"""
+            user_id = message.from_user.id
+            first_name = message.from_user.first_name
             
-            return {
-                'id': bot.id,
-                'username': bot.username,
-                'name': bot.first_name
-            }
-        except Exception as e:
-            logger.error(f"خطا در تست توکن: {e}")
-            return None
+            welcome_msg = self.render_config['welcome_message']
+            
+            # ایجاد کیبورد اصلی
+            markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+            btn1 = types.KeyboardButton("➕ افزودن ربات")
+            btn2 = types.KeyboardButton("📋 ربات‌های من")
+            btn3 = types.KeyboardButton("ℹ️ راهنمایی")
+            markup.add(btn1, btn2, btn3)
+            
+            await self.bot.send_message(
+                message.chat.id,
+                welcome_msg,
+                reply_markup=markup
+            )
+        
+        @self.bot.message_handler(commands=['addbot'])
+        async def add_bot_handler(message):
+            """هندلر افزودن ربات جدید"""
+            instructions = self.render_config['add_bot_instructions']
+            
+            await self.bot.send_message(
+                message.chat.id,
+                instructions,
+                parse_mode='Markdown'
+            )
+            
+            # درخواست توکن
+            msg = await self.bot.send_message(
+                message.chat.id,
+                "لطفاً توکن ربات خود را ارسال کنید:"
+            )
+            
+            # ثبت برای دریافت توکن
+            await self.bot.register_next_step_handler(msg, self.process_token)
+        
+        @self.bot.message_handler(commands=['mybots'])
+        async def my_bots_handler(message):
+            """هندلر مشاهده ربات‌های کاربر"""
+            user_id = message.from_user.id
+            
+            if user_id not in self.user_bots:
+                await self.bot.send_message(
+                    message.chat.id,
+                    self.render_config['no_bots_found']
+                )
+                return
+            
+            bot_list = self.render_config['bot_list']
+            user_bots_info = self.user_bots[user_id]
+            
+            for idx, bot_info in enumerate(user_bots_info, 1):
+                bot_list += f"{idx}. @{bot_info.get('username', 'نامشخص')}\n"
+                bot_list += f"   توکن: `{bot_info['token'][:10]}...`\n"
+                bot_list += f"   وضعیت: {'✅ فعال' if bot_info.get('active', False) else '❌ غیرفعال'}\n\n"
+            
+            await self.bot.send_message(
+                message.chat.id,
+                bot_list,
+                parse_mode='Markdown'
+            )
+        
+        @self.bot.message_handler(commands=['help'])
+        async def help_handler(message):
+            """هندلر راهنمایی"""
+            await self.bot.send_message(
+                message.chat.id,
+                self.render_config['help_message'],
+                parse_mode='Markdown'
+            )
+        
+        @self.bot.message_handler(func=lambda message: True)
+        async def text_handler(message):
+            """هندلر پیام‌های متنی"""
+            text = message.text
+            
+            if text == "➕ افزودن ربات":
+                await add_bot_handler(message)
+            elif text == "📋 ربات‌های من":
+                await my_bots_handler(message)
+            elif text == "ℹ️ راهنمایی":
+                await help_handler(message)
+            else:
+                await self.bot.send_message(
+                    message.chat.id,
+                    "دستور نامعتبر است. از منو استفاده کنید."
+                )
     
-    def error_handler(self, update: Update, context: CallbackContext):
-        """مدیریت خطاها"""
-        logger.error(f"خطای ربات: {context.error}")
+    async def process_token(self, message):
+        """پردازش توکن دریافتی از کاربر"""
+        user_id = message.from_user.id
+        token = message.text.strip()
+        
+        # اعتبارسنجی اولیه توکن
+        if not token or len(token) < 30:
+            await self.bot.send_message(
+                message.chat.id,
+                "❌ توکن نامعتبر است. لطفاً توکن صحیح را ارسال کنید."
+            )
+            return
         
         try:
-            if update and update.effective_message:
-                update.effective_message.reply_text(
-                    "❌ متأسفانه خطایی رخ داد.\n"
-                    "لطفاً بعداً تلاش کنید."
+            # ایجاد ربات جدید با توکن کاربر
+            user_bot = AsyncTeleBot(token)
+            
+            # بررسی صحت توکن با یک درخواست تست
+            bot_info = await user_bot.get_me()
+            bot_username = bot_info.username
+            
+            # ذخیره اطلاعات ربات کاربر
+            if user_id not in self.user_bots:
+                self.user_bots[user_id] = []
+            
+            bot_data = {
+                'bot_instance': user_bot,
+                'token': token,
+                'username': bot_username,
+                'owner_id': user_id,
+                'active': True,
+                'created_at': datetime.now().isoformat()
+            }
+            
+            self.user_bots[user_id].append(bot_data)
+            
+            # راه‌اندازی ربات کاربر
+            await self.setup_user_bot(bot_data)
+            
+            await self.bot.send_message(
+                message.chat.id,
+                self.render_config['bot_added_success'],
+                parse_mode='Markdown'
+            )
+            
+            # نمایش اطلاعات ربات
+            info_msg = (
+                f"📊 اطلاعات ربات شما:\n\n"
+                f"نام: @{bot_username}\n"
+                f"توکن: `{token[:15]}...`\n"
+                f"تاریخ ایجاد: {datetime.now().strftime('%Y/%m/%d %H:%M')}\n\n"
+                f"کاربران می‌توانند از طریق @{bot_username} با شما چت ناشناس داشته باشند."
+            )
+            
+            await self.bot.send_message(
+                message.chat.id,
+                info_msg,
+                parse_mode='Markdown'
+            )
+            
+        except Exception as e:
+            logger.error(f"خطا در ایجاد ربات کاربر: {e}")
+            await self.bot.send_message(
+                message.chat.id,
+                f"❌ خطا در ایجاد ربات: {str(e)}"
+            )
+    
+    async def setup_user_bot(self, bot_data: Dict):
+        """راه‌اندازی و تنظیم ربات کاربر"""
+        user_bot = bot_data['bot_instance']
+        owner_id = bot_data['owner_id']
+        bot_username = bot_data['username']
+        
+        @user_bot.message_handler(func=lambda m: True, content_types=['text', 'photo', 'video', 'document', 'voice'])
+        async def user_bot_message_handler(message):
+            """هندلر پیام‌های دریافتی توسط ربات کاربر"""
+            sender_id = message.from_user.id
+            chat_id = message.chat.id
+            
+            # جلوگیری از پاسخ به پیام‌های خود ربات
+            if sender_id == (await user_bot.get_me()).id:
+                return
+            
+            # ذخیره نگاشت چت
+            self.chat_mapping[sender_id] = owner_id
+            
+            # ایجاد پیام برای مالک
+            message_text = self.prepare_message_for_owner(message, bot_username)
+            
+            # ایجاد اینلاین کیبورد
+            inline_markup = types.InlineKeyboardMarkup()
+            
+            # دکمه مشاهده پروفایل
+            profile_btn = types.InlineKeyboardButton(
+                self.render_config['view_profile_btn'],
+                url=f"tg://user?id={sender_id}"
+            )
+            
+            # دکمه پاسخ
+            reply_btn = types.InlineKeyboardButton(
+                self.render_config['reply_btn'],
+                callback_data=f"reply_{sender_id}_{bot_username}"
+            )
+            
+            # دکمه مسدود کردن
+            block_btn = types.InlineKeyboardButton(
+                self.render_config['block_btn'],
+                callback_data=f"block_{sender_id}_{bot_username}"
+            )
+            
+            inline_markup.row(profile_btn)
+            inline_markup.row(reply_btn, block_btn)
+            
+            try:
+                # ارسال پیام به مالک
+                await self.bot.send_message(
+                    owner_id,
+                    message_text,
+                    reply_markup=inline_markup,
+                    parse_mode='HTML'
                 )
+                
+                # پاسخ به کاربر مبنی بر دریافت پیام
+                await user_bot.send_message(
+                    chat_id,
+                    "✅ پیام شما دریافت شد و به صورت ناشناس ارسال گردید."
+                )
+                
+            except Exception as e:
+                logger.error(f"خطا در ارسال پیام به مالک: {e}")
+        
+        @user_bot.callback_query_handler(func=lambda call: True)
+        async def user_bot_callback_handler(call):
+            """هندلر callback های ربات کاربر"""
+            await user_bot.answer_callback_query(call.id, "در حال پردازش...")
+        
+        # راه‌اندازی وب هوک برای ربات کاربر اگر آدرس مشخص شده
+        if self.webhook_url:
+            webhook_path = f"/webhook/{bot_username}_{owner_id}"
+            full_webhook_url = f"{self.webhook_url}{webhook_path}"
+            
+            try:
+                await user_bot.remove_webhook()
+                await user_bot.set_webhook(
+                    url=full_webhook_url,
+                    drop_pending_updates=True
+                )
+                logger.info(f"Webhook set for @{bot_username}: {full_webhook_url}")
+            except Exception as e:
+                logger.error(f"خطا در تنظیم وب هوک: {e}")
+        
+        # ذخیره هندلرها برای استفاده بعدی
+        bot_data['handlers'] = {
+            'message_handler': user_bot_message_handler,
+            'callback_handler': user_bot_callback_handler
+        }
+        
+        logger.info(f"ربات کاربر @{bot_username} برای مالک {owner_id} راه‌اندازی شد")
+    
+    def prepare_message_for_owner(self, message, bot_username: str) -> str:
+        """آماده‌سازی پیام برای نمایش به مالک"""
+        sender = message.from_user
+        sender_name = sender.first_name or ""
+        sender_last_name = sender.last_name or ""
+        full_name = f"{sender_name} {sender_last_name}".strip()
+        
+        message_text = self.render_config['message_received']
+        message_text += f"📨 از: {full_name}\n"
+        message_text += f"🆔 آیدی: <code>{sender.id}</code>\n"
+        message_text += f"🤖 از طریق: @{bot_username}\n"
+        message_text += f"⏰ زمان: {datetime.now().strftime('%H:%M:%S')}\n\n"
+        
+        if message.content_type == 'text':
+            message_text += f"📝 پیام:\n{message.text}"
+        elif message.content_type == 'photo':
+            message_text += "🖼 عکس ارسال شده"
+        elif message.content_type == 'video':
+            message_text += "🎬 ویدیو ارسال شده"
+        elif message.content_type == 'document':
+            message_text += f"📎 فایل: {message.document.file_name}"
+        elif message.content_type == 'voice':
+            message_text += "🎤 پیام صوتی"
+        
+        return message_text
+    
+    async def setup_callback_handlers(self):
+        """تنظیم هندلرهای callback برای ربات مادر"""
+        
+        @self.bot.callback_query_handler(func=lambda call: call.data.startswith('reply_'))
+        async def reply_callback_handler(call):
+            """هندلر پاسخ به پیام"""
+            data_parts = call.data.split('_')
+            if len(data_parts) < 3:
+                await self.bot.answer_callback_query(call.id, "خطا در پردازش")
+                return
+            
+            target_user_id = int(data_parts[1])
+            bot_username = data_parts[2]
+            
+            await self.bot.answer_callback_query(call.id, "لطفاً پاسخ خود را تایپ کنید...")
+            
+            # درخواست پاسخ از مالک
+            msg = await self.bot.send_message(
+                call.from_user.id,
+                f"لطفاً پاسخ خود را برای کاربر با آیدی {target_user_id} ارسال کنید:"
+            )
+            
+            # ثبت برای دریافت پاسخ
+            await self.bot.register_next_step_handler(msg, self.process_reply, target_user_id, bot_username)
+        
+        @self.bot.callback_query_handler(func=lambda call: call.data.startswith('block_'))
+        async def block_callback_handler(call):
+            """هندلر مسدود کردن کاربر"""
+            data_parts = call.data.split('_')
+            if len(data_parts) < 3:
+                await self.bot.answer_callback_query(call.id, "خطا در پردازش")
+                return
+            
+            target_user_id = int(data_parts[1])
+            bot_username = data_parts[2]
+            
+            # پیدا کردن ربات مربوطه
+            owner_id = call.from_user.id
+            user_bots = self.user_bots.get(owner_id, [])
+            
+            target_bot = None
+            for bot_data in user_bots:
+                if bot_data['username'] == bot_username:
+                    target_bot = bot_data['bot_instance']
+                    break
+            
+            if target_bot:
+                try:
+                    # مسدود کردن کاربر (در واقع فقط اطلاع‌رسانی)
+                    await target_bot.send_message(
+                        target_user_id,
+                        "متأسفانه شما توسط مالک ربات مسدود شده‌اید و نمی‌توانید پیام ارسال کنید."
+                    )
+                    
+                    await self.bot.answer_callback_query(
+                        call.id,
+                        "کاربر مسدود شد و به او اطلاع داده شد."
+                    )
+                    
+                    await self.bot.send_message(
+                        owner_id,
+                        f"✅ کاربر با آیدی {target_user_id} مسدود شد."
+                    )
+                    
+                except Exception as e:
+                    logger.error(f"خطا در مسدود کردن کاربر: {e}")
+                    await self.bot.answer_callback_query(call.id, "خطا در مسدود کردن")
+            else:
+                await self.bot.answer_callback_query(call.id, "ربات مورد نظر یافت نشد")
+    
+    async def process_reply(self, message, target_user_id: int, bot_username: str):
+        """پردازش پاسخ مالک به کاربر"""
+        owner_id = message.from_user.id
+        
+        # پیدا کردن ربات مربوطه
+        user_bots = self.user_bots.get(owner_id, [])
+        target_bot = None
+        
+        for bot_data in user_bots:
+            if bot_data['username'] == bot_username:
+                target_bot = bot_data['bot_instance']
+                break
+        
+        if not target_bot:
+            await self.bot.send_message(
+                owner_id,
+                "❌ ربات مورد نظر یافت نشد."
+            )
+            return
+        
+        try:
+            # ارسال پاسخ به کاربر
+            reply_text = f"📬 پاسخ از مالک:\n\n{message.text}"
+            await target_bot.send_message(target_user_id, reply_text)
+            
+            await self.bot.send_message(
+                owner_id,
+                f"✅ پاسخ شما به کاربر با آیدی {target_user_id} ارسال شد."
+            )
+            
+        except Exception as e:
+            logger.error(f"خطا در ارسال پاسخ: {e}")
+            await self.bot.send_message(
+                owner_id,
+                f"❌ خطا در ارسال پاسخ: {str(e)}"
+            )
+    
+    def update_render_config(self, new_config: Dict):
+        """به‌روزرسانی تنظیمات رندر"""
+        self.render_config.update(new_config)
+        logger.info("تنظیمات رندر به‌روزرسانی شد")
+    
+    async def start_polling(self):
+        """شروع polling برای ربات مادر"""
+        logger.info("شروع polling برای ربات مادر...")
+        
+        # تنظیم هندلرهای callback
+        await self.setup_callback_handlers()
+        
+        # حذف وب هوک قبلی (اگر存在 دارد)
+        await self.bot.remove_webhook()
+        
+        # شروع polling
+        await self.bot.polling(non_stop=True, timeout=60)
+    
+    async def start_webhook(self):
+        """شروع وب هوک برای ربات مادر"""
+        logger.info("شروع وب هوک برای ربات مادر...")
+        
+        # تنظیم هندلرهای callback
+        await self.setup_callback_handlers()
+        
+        # تنظیم وب هوک
+        await self.bot.remove_webhook()
+        await self.bot.set_webhook(
+            url=f"{self.webhook_url}/webhook/master",
+            drop_pending_updates=True
+        )
+        
+        logger.info(f"وب هوک ربات مادر تنظیم شد: {self.webhook_url}/webhook/master")
+        
+        # اجرای سرور Flask
+        app = Flask(__name__)
+        
+        @app.route('/webhook/master', methods=['POST'])
+        def master_webhook():
+            """وب هوک ربات مادر"""
+            if request.headers.get('content-type') == 'application/json':
+                json_string = request.get_data().decode('utf-8')
+                update = types.Update.de_json(json_string)
+                
+                # پردازش آپدیت در تابع جداگانه
+                asyncio.create_task(self.bot.process_new_updates([update]))
+                
+                return jsonify({"status": "ok"}), 200
+            else:
+                return jsonify({"error": "Invalid content type"}), 403
+        
+        # شروع سرور Flask
+        app.run(host='0.0.0.0', port=self.port)
+    
+    def run(self, use_webhook: bool = False):
+        """اجرای ربات"""
+        if use_webhook and self.webhook_url:
+            asyncio.run(self.start_webhook())
+        else:
+            asyncio.run(self.start_polling())
+
+
+# ========== تابع اصلی اجرا ==========
+def main():
+    """تابع اصلی اجرای ربات"""
+    
+    # خواندن توکن از متغیر محیطی یا فایل
+    token = os.environ.get('MASTER_BOT_TOKEN')
+    
+    if not token:
+        # اگر توکن در متغیر محیطی نبود، از فایل بخوان
+        try:
+            with open('config.json', 'r') as f:
+                config = json.load(f)
+                token = config.get('master_bot_token')
+        except FileNotFoundError:
+            # ایجاد فایل config.json نمونه
+            sample_config = {
+                "master_bot_token": "YOUR_MASTER_BOT_TOKEN_HERE",
+                "webhook_url": "https://yourdomain.com",
+                "port": 8443
+            }
+            with open('config.json', 'w') as f:
+                json.dump(sample_config, f, indent=4)
+            
+            print("⚠️ فایل config.json ایجاد شد. لطفاً توکن ربات مادر را در آن وارد کنید.")
+            return
+    
+    # خواندن تنظیمات وب هوک
+    webhook_url = os.environ.get('WEBHOOK_URL')
+    port = int(os.environ.get('PORT', 8443))
+    
+    if not webhook_url:
+        try:
+            with open('config.json', 'r') as f:
+                config = json.load(f)
+                webhook_url = config.get('webhook_url')
+                port = config.get('port', port)
         except:
             pass
     
-    def run(self):
-        """اجرای ربات"""
-        logger.info("🚀 ربات در حال راه‌اندازی...")
-        
-        self.updater.start_polling()
-        logger.info("✅ ربات شروع به کار کرد!")
-        
-        self.updater.idle()
+    # ایجاد و اجرای ربات
+    bot = AnonymousChatBot(
+        token=token,
+        webhook_url=webhook_url,
+        port=port
+    )
+    
+    # اضافه کردن تنظیمات سفارشی رندر (اختیاری)
+    custom_render_config = {
+        'welcome_message': "🌟 به پیشرفته‌ترین ربات چت ناشناس خوش آمدید!",
+        # می‌توانید سایر تنظیمات را اینجا تغییر دهید
+    }
+    
+    bot.update_render_config(custom_render_config)
+    
+    # اجرای ربات
+    use_webhook = bool(webhook_url)
+    print(f"🚀 ربات در حال اجرا است... (Webhook: {use_webhook})")
+    bot.run(use_webhook=use_webhook)
 
-# ==================== سرور وب برای رندر ====================
-def run_web_server():
-    """اجرای سرور وب ساده"""
-    try:
-        from flask import Flask, jsonify
-        import threading
-        
-        app = Flask(__name__)
-        
-        @app.route('/')
-        def home():
-            return jsonify({
-                "status": "running",
-                "service": "mother-bot",
-                "time": datetime.now().isoformat()
-            })
-        
-        @app.route('/health')
-        def health():
-            return jsonify({"status": "healthy"})
-        
-        @app.route('/ping')
-        def ping():
-            return jsonify({"pong": time.time()})
-        
-        # اجرا در ترد جداگانه
-        port = int(os.environ.get('PORT', 10000))
-        thread = threading.Thread(
-            target=lambda: app.run(host='0.0.0.0', port=port, debug=False, threaded=True),
-            daemon=True
-        )
-        thread.start()
-        
-        logger.info(f"🌐 سرور وب روی پورت {port} راه‌اندازی شد")
-        
-    except ImportError:
-        logger.warning("Flask نصب نیست، سرور وب اجرا نمی‌شود")
-    except Exception as e:
-        logger.error(f"خطا در سرور وب: {e}")
 
-# ==================== اجرای اصلی ====================
-def main():
-    """تابع اصلی"""
-    
-    print("=" * 60)
-    print("🤖 **ربات مادر ساخت ربات چت ناشناس**")
-    print("=" * 60)
-    
-    # بررسی توکن
-    token = os.environ.get('MOTHER_BOT_TOKEN', '').strip()
-    if not token or token == 'YOUR_BOT_TOKEN_HERE':
-        print("\n⚠️  لطفاً توکن ربات را تنظیم کنید!")
-        print("\nدر رندر:")
-        print("1. به Dashboard بروید")
-        print("2. روی سرویس کلیک کنید")
-        print("3. Environment → Add Environment Variable")
-        print("4. اضافه کنید: MOTHER_BOT_TOKEN = توکن_ربات_شما")
-        print("\nمقادیر اختیاری:")
-        print("MAX_BOTS_PER_USER = 3 (پیش‌فرض)")
-        print("=" * 60)
-        
-        # اگر در رندر هستیم
-        if os.environ.get('RENDER'):
-            print("⏳ منتظر تنظیم توکن...")
-            time.sleep(10)
-            token = os.environ.get('MOTHER_BOT_TOKEN', '').strip()
-            if not token or token == 'YOUR_BOT_TOKEN_HERE':
-                print("❌ توکن تنظیم نشده. ادامه بدون ربات...")
-                # فقط سرور وب را اجرا می‌کنیم
-                run_web_server()
-                time.sleep(3600)  # یک ساعت منتظر می‌مانیم
-                return
-    
-    # شروع سرور وب (اگر در رندر هستیم)
-    if os.environ.get('RENDER'):
-        run_web_server()
-    
-    try:
-        # ایجاد و اجرای ربات
-        bot = MotherBot()
-        
-        print(f"\n✅ ربات راه‌اندازی شد")
-        print(f"🔐 توکن: {token[:10]}...")
-        print(f"📊 حداکثر ربات: {bot.max_bots}")
-        print("=" * 60)
-        print("\n🎯 به تلگرام بروید و /start را بزنید")
-        print("=" * 60)
-        
-        bot.run()
-        
-    except Exception as e:
-        logger.error(f"❌ خطا: {str(e)}")
-        
-        # در رندر منتظر می‌مانیم
-        if os.environ.get('RENDER'):
-            time.sleep(30)
-
-# نقطه ورود
+# ========== اجرا در صورت فراخوانی مستقیم ==========
 if __name__ == "__main__":
-    main()
+    # برای اجرا در محیط‌های مختلف
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n👋 ربات متوقف شد.")
+    except Exception as e:
+        logger.error(f"خطای اصلی: {e}")
+        print(f"❌ خطا در اجرای ربات: {e}")
