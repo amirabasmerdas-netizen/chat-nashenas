@@ -3,14 +3,14 @@ services:
     name: mother-bot
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
     envVars:
       - key: MOTHER_BOT_TOKEN
         sync: false
       - key: MAX_BOTS_PER_USER
         value: "3"
       - key: PORT
-        value: "8443"
+        value: "10000"
       - key: RENDER
         value: "true"
     healthCheckPath: /health
